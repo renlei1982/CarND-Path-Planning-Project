@@ -8,6 +8,8 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "trajector_gen.h"
+#include "cost.h"
 
 using namespace std;
 
@@ -15,9 +17,7 @@ using namespace std;
 using json = nlohmann::json;
 
 // For converting back and forth between radians and degrees.
-constexpr double pi() { return M_PI; }
-double deg2rad(double x) { return x * pi() / 180; }
-double rad2deg(double x) { return x * 180 / pi(); }
+
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -131,33 +131,22 @@ vector<double> getFrenet(double x, double y, double theta, vector<double> maps_x
 
 }
 
-// Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> maps_x, vector<double> maps_y)
-{
-	int prev_wp = -1;
 
-	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1) ))
-	{
-		prev_wp++;
-	}
 
-	int wp2 = (prev_wp+1)%maps_x.size();
+// set the lane num
+int lane = 1;
 
-	double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
-	// the x,y,s along the segment
-	double seg_s = (s-maps_s[prev_wp]);
+// set the reference velocity
+double ref_vel = 0; // unit in mph
 
-	double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
-	double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
+int count_number = 0;
 
-	double perp_heading = heading-pi()/2;
+double d_error = 0;
+double p_error = 0;
+double i_error = 0;
 
-	double x = seg_x + d*cos(perp_heading);
-	double y = seg_y + d*sin(perp_heading);
 
-	return {x,y};
 
-}
 
 int main() {
   uWS::Hub h;
@@ -196,6 +185,10 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
+
+
+
+
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -203,18 +196,21 @@ int main() {
     // The 2 signifies a websocket event
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
+
+
+
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
       auto s = hasData(data);
 
       if (s != "") {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
-        
+
         if (event == "telemetry") {
           // j[1] is the data JSON object
-          
+
         	// Main car's localization Data
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
@@ -226,18 +222,224 @@ int main() {
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
+          	// Previous path's end s and d values
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
 
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
+          	int prev_size = previous_path_x.size();
+
+          	double current_s = car_s;
+
+          	count_number++;
+
+
+          	if (prev_size > 0){
+                car_s = end_path_s;
+          	}
+
+            // Set up the trajector generator class
+          	T_GEN trajector_generator;
+
+            // Set up the total cost for each lane, totally 3 lanes
+            vector<double> total_cost = {0.0, 0.0, 0.0};
+
+            // Loop across the lanes and score their costs
+          	for (int new_lane = 0; new_lane < 3; new_lane++){
+
+                // Define a minimum cost number, and flag the car id as -1 at the beginning
+                // Also define the slowest speed, and flag the car id as -1 at the beginning
+                int slowest_ahead_car_id = -1;
+                int closest_ahead_car_id = -1;
+                double closest_ahead_distance = 1000000;
+                double slowest_ahead_car_speed = 100;
+
+                for (int i = 0; i < sensor_fusion.size(); i++){
+                    float d = sensor_fusion[i][6];
+
+                    // Identify the cars in the target lane
+                    if (d < (2 + 4 * new_lane + 2) && d > (2 + 4* new_lane -2)){
+
+                        double vx = sensor_fusion[i][3];
+                        double vy = sensor_fusion[i][4];
+                        double check_speed = sqrt(vx*vx + vy*vy);
+                        double check_car_s = sensor_fusion[i][5];
+
+                        // Find out the closest car in front of the ego car
+                        // Find out the slowest car in front of the ego car
+                        if (check_car_s > current_s){
+                            if((check_car_s - current_s) < closest_ahead_distance){
+                                closest_ahead_car_id = i;
+                                closest_ahead_distance = check_car_s - current_s;
+                            }
+                            if (check_speed < slowest_ahead_car_speed){
+                                slowest_ahead_car_id = i;
+                                slowest_ahead_car_speed = check_speed;
+                            }
+                        };
+                    };
+                };
+
+                // Calculate the distance cost of the closest car, and the speed cost of the slowest car
+                // The cost function could be found at cost.h
+                // If the target lane and current lane are not the same, a lane change cost should be added to the total cost
+                if (closest_ahead_distance < 300){
+                    total_cost[new_lane] += distance_cost(closest_ahead_distance);
+                }
+                if (slowest_ahead_car_speed != 100){
+                    total_cost[new_lane] += slow_cost(slowest_ahead_car_speed);
+                }
+                if (new_lane != lane){
+                    total_cost[new_lane] += lane_change_cost();
+                }
+          	}
+
+
+            // Loop over the total costs of the three lanes and find out the one with minimum cost
+            // and define it as lane_decision
+            double min_total_cost = total_cost[0];
+          	int lane_decision = 0;
+
+          	for (int i = 0; i < 3; i++){
+                if (total_cost[i] < min_total_cost){
+                    min_total_cost = total_cost[i];
+                    lane_decision = i;
+                }
+            }
+
+            // Define the target lane as 0 at the beginning
+            int target_lane = 0;
+
+            // Get the potential lane by comparing the lane_decision with lane. Only single lane change is allowed,
+            // so the car will just change one lane even when the current lane is two lanes away from lane_decision.
+            if (lane > lane_decision && lane > 0){
+                target_lane = lane - 1;
+            }
+            else if (lane < lane_decision && lane < 2){
+                target_lane = lane + 1;
+            }
+            else{
+                target_lane = lane;
+            }
+
+
+
+            bool lane_change_feasible = true;
+
+            // Check the feasibility of changing to the target lane without collision
+            if (target_lane != lane){
+
+                // Define the hypothetical (x, y) values for the target lane trajectory
+                vector<double> h_next_x_vals;
+                vector<double> h_next_y_vals;
+                vector<double> s_and_d;
+
+                // Define the hypothetical target lane trajectory
+                vector<vector<double>> h_traj;
+
+                h_traj = trajector_generator.Solve(ref_vel, target_lane, car_x, car_y, car_s, car_d, car_yaw,
+                                                   car_speed, previous_path_x, previous_path_y, end_path_s, end_path_d,
+                                                   map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+                h_next_x_vals = h_traj[0];
+                h_next_y_vals = h_traj[1];
+
+                int traj_size = h_next_x_vals.size();
+
+                double p_x = h_next_x_vals[traj_size - 1];
+                double p_y = h_next_y_vals[traj_size - 1];
+                double p_x_prev = h_next_x_vals[traj_size - 2];
+                double p_y_prev = h_next_y_vals[traj_size - 2];
+                double p_yaw = atan2(p_y - p_y_prev, p_x - p_x_prev);
+
+                s_and_d = getFrenet(p_x, p_y, p_yaw, map_waypoints_x, map_waypoints_y);
+                double p_s = s_and_d[0];
+                double p_d = s_and_d[1];
+
+                for (int i = 0; i < sensor_fusion.size(); i++){
+                    float d = sensor_fusion[i][6];
+
+                    // Identify the cars in the target lane
+                    if (d < (2 + 4 * target_lane + 2) && d > (2 + 4* target_lane -2)){
+
+                        double vx = sensor_fusion[i][3];
+                        double vy = sensor_fusion[i][4];
+                        double check_speed = sqrt(vx*vx + vy*vy);
+                        double check_car_s = sensor_fusion[i][5];
+                        double orig_check_car_s = check_car_s;
+
+                        check_car_s += ((double)traj_size * 0.02 * check_speed);
+
+                        // Check if any car exists within 12 m away from the ego car,
+                        // either by the predicted s at the end of the trajectory,
+                        // or by the current s of the checked car and ego car.
+                        // If it does, the lane change is not feasible.
+                        if (abs(check_car_s - p_s) < 12 || abs(orig_check_car_s - current_s) < 12){
+                            lane_change_feasible = false;
+                        }
+          	        }
+                }
+          	}
+
+
+          	// If the lane change is feasible, car speed is higher than 30 and count number larger than 50,
+          	// change the lane, and return count number to zero.
+          	// The purpose of the count number is to prevent the double lane change which might induce jerk.
+          	if (lane_change_feasible && car_speed > 30 && count_number > 50){
+                lane = target_lane;
+                count_number = 0;
+          	}
+
+            // Regulate the ego car speed by checking the distance with the front car
+            double acceleration = 0.224;
+            double closest_distance = 10000;
+            int closest_speed = -1;
+
+          	for (int i = 0; i < sensor_fusion.size(); i++){
+                float d = sensor_fusion[i][6];
+                if (d < (2 + 4 * lane + 2) && d > (2 + 4* lane -2)){
+                    double vx = sensor_fusion[i][3];
+                    double vy = sensor_fusion[i][4];
+                    double check_speed = sqrt(vx*vx + vy*vy);
+                    double check_car_s = sensor_fusion[i][5];
+                    double orig_check_car_s = check_car_s;
+
+                    // Find out the speed and distance of the car right in front of ego car
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s) && ((check_car_s - car_s) < closest_distance)){
+                        closest_distance = check_car_s - car_s;
+                        closest_speed = check_speed;
+                    }
+                }
+          	}
+
+            // If the front car is within 35 m and its speed is smaller than the ego car,
+            // adjust the speed of the ego car close to the front car
+          	if(closest_distance < 35 && closest_speed != -1 && (ref_vel/2.24) > closest_speed){
+               ref_vel -= 0.224;
+          	}
+          	// Otherwise keep the ego car speed at 49.5
+          	else if (closest_distance > 35 && ref_vel < 49.5){
+              ref_vel += acceleration;
+          	}
+
+
+            // Define the actual x, y used in the next waypoints status
+            vector<double> next_x_vals;
+            vector<double> next_y_vals;
+            vector<vector<double>> traj;
+
+            // Generate the values for the next trajectory
+            traj = trajector_generator.Solve(ref_vel, lane, car_x, car_y, car_s, car_d, car_yaw,
+                                             car_speed, previous_path_x, previous_path_y, end_path_s, end_path_d,
+                                             map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            next_x_vals = traj[0];
+            next_y_vals = traj[1];
+
           	json msgJson;
-
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
-
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
@@ -247,7 +449,7 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+
         }
       } else {
         // Manual driving
@@ -290,83 +492,4 @@ int main() {
   }
   h.run();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
